@@ -454,6 +454,24 @@ struct TransportSettings {
   // server side.
   uint16_t maxServerRecvPacketsPerLoop{1};
 
+  // Use recvmmsg for server-side ingress batching instead of the per-packet
+  // recvmsg loop driven by folly's maxReadsPerEvent.  When true the worker
+  // calls recvmmsg in a drain loop (until EAGAIN) each time the socket
+  // notifies readability, receiving up to serverRecvBatchSize datagrams per
+  // syscall.
+  bool useRecvmmsgForServerRecv{false};
+
+  // Number of datagram slots per recvmmsg call when useRecvmmsgForServerRecv
+  // is true.  Analogous to picoquic's kRecvBatchSize (default 16).
+  uint16_t serverRecvBatchSize{16};
+
+  // Consolidate per-connection write-loop callbacks into one shared
+  // EventBase::LoopCallback per loop iteration (server-side only).
+  // Reduces scheduling overhead and preserves epoll_wait idle time at
+  // high connection counts.  Requires QuicServerWorker support.
+  bool useSharedWriteLooper{false};
+
+
   // Support "paused" requests which buffer on the server without streaming back
   // to the client.
   bool disablePausedPriority{false};

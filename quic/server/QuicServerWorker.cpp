@@ -470,6 +470,94 @@ void QuicServerWorker::onDataAvailable(
   }
 }
 
+bool QuicServerWorker::shouldOnlyNotify() {
+  return transportSettings_.useRecvmmsgForServerRecv;
+}
+
+void QuicServerWorker::onNotifyDataAvailable(
+    FollyAsyncUDPSocketAlias& sock) noexcept {
+  const uint16_t batchSize = transportSettings_.serverRecvBatchSize;
+  const uint64_t readBufferSize = transportSettings_.maxRecvPacketSize;
+
+  if (recvmmsgState_.msgs.size() != batchSize) {
+    recvmmsgState_.resize(batchSize);
+  }
+
+  // Drain the socket: keep calling recvmmsg until EAGAIN or the per-loop
+  // packet cap (maxServerRecvPacketsPerLoop) is reached.  The cap preserves
+  // the same loop-ceiling guarantee as the per-packet recvmsg path so the
+  // EVB returns to handle new publisher data on schedule.
+  const uint32_t maxPkts = transportSettings_.maxServerRecvPacketsPerLoop;
+  uint32_t totalRecvd = 0;
+  while (totalRecvd < maxPkts) {
+    // (Re-)initialize slots whose buffers were consumed in the previous batch.
+    for (uint16_t i = 0; i < batchSize; ++i) {
+      if (!recvmmsgState_.bufs[i]) {
+        recvmmsgState_.bufs[i] = BufHelpers::createCombined(readBufferSize);
+      }
+      auto& iov = recvmmsgState_.iovecs[i];
+      iov.iov_base = recvmmsgState_.bufs[i]->writableData();
+      iov.iov_len = readBufferSize;
+
+      auto* hdr = &recvmmsgState_.msgs[i].msg_hdr;
+      hdr->msg_iov = &iov;
+      hdr->msg_iovlen = 1;
+      hdr->msg_name = &recvmmsgState_.addrs[i];
+      hdr->msg_namelen = sizeof(struct sockaddr_storage);
+      hdr->msg_control = nullptr;
+      hdr->msg_controllen = 0;
+      hdr->msg_flags = 0;
+      recvmmsgState_.msgs[i].msg_len = 0;
+    }
+
+    int numRecvd = sock.recvmmsg(
+        recvmmsgState_.msgs.data(), batchSize, /*flags=*/0, /*timeout=*/nullptr);
+
+    if (numRecvd < 0) {
+      // EAGAIN/EWOULDBLOCK: socket is drained.
+      break;
+    }
+    if (numRecvd == 0) {
+      break;
+    }
+
+    auto batchReceiveTime = Clock::now();
+    if (batchReceiveTime < largestPacketReceiveTime_) {
+      batchReceiveTime = largestPacketReceiveTime_;
+    }
+    largestPacketReceiveTime_ = batchReceiveTime;
+
+    for (int i = 0; i < numRecvd; ++i) {
+      size_t len = recvmmsgState_.msgs[i].msg_len;
+      if (len == 0) {
+        continue;
+      }
+
+      folly::SocketAddress client;
+      client.setFromSockaddr(
+          reinterpret_cast<const sockaddr*>(&recvmmsgState_.addrs[i]),
+          sizeof(struct sockaddr_storage));
+
+      auto& buf = recvmmsgState_.bufs[i];
+      buf->append(len);
+
+      QUIC_STATS(statsCallback_, onPacketReceived);
+      QUIC_STATS(statsCallback_, onRead, len);
+
+      ReceivedUdpPacket udpPacket(std::move(buf));
+      udpPacket.timings.receiveTimePoint = batchReceiveTime;
+      handleNetworkData(client, udpPacket);
+    }
+
+    totalRecvd += static_cast<uint32_t>(numRecvd);
+
+    // Partial batch: socket is drained.
+    if (static_cast<uint16_t>(numRecvd) < batchSize) {
+      break;
+    }
+  }
+}
+
 void QuicServerWorker::handleNetworkData(
     const folly::SocketAddress& client,
     ReceivedUdpPacket& udpPacket,

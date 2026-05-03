@@ -291,6 +291,11 @@ class QuicServerWorker : public FollyAsyncUDPSocketAlias::ReadCallback,
       bool truncated,
       OnDataAvailableParams params) noexcept override;
 
+  bool shouldOnlyNotify() override;
+
+  void onNotifyDataAvailable(
+      FollyAsyncUDPSocketAlias& sock) noexcept override;
+
   // Routing callback
   /**
    * Called when a connection id is available for a new connection (i.e flow)
@@ -540,6 +545,22 @@ class QuicServerWorker : public FollyAsyncUDPSocketAlias::ReadCallback,
   // Contains every unique transport that is mapped in connectionIdMap_.
   folly::F14FastMap<QuicServerTransport*, std::weak_ptr<QuicServerTransport>>
       boundServerTransports_;
+
+  // Storage for recvmmsg-based ingress batching (useRecvmmsgForServerRecv).
+  struct RecvmmsgState {
+    std::vector<struct mmsghdr> msgs;
+    std::vector<struct sockaddr_storage> addrs;
+    std::vector<struct iovec> iovecs;
+    std::vector<BufPtr> bufs;
+
+    void resize(uint16_t n) {
+      msgs.resize(n);
+      addrs.resize(n);
+      iovecs.resize(n);
+      bufs.resize(n);
+    }
+  };
+  RecvmmsgState recvmmsgState_;
 
   BufPtr readBuffer_;
   bool shutdown_{false};
