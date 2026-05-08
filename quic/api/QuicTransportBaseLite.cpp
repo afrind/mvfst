@@ -1104,6 +1104,10 @@ QuicTransportBaseLite::getStreamFlowControl(StreamId id) const {
       stream->flowControlState.advertisedMaxOffset);
 }
 
+void QuicTransportBaseLite::scheduleWrite() {
+  runOnEvbAsyncOp({.type = AsyncOpType::ConnectionWriteReady});
+}
+
 void QuicTransportBaseLite::runOnEvbAsyncOp(AsyncOpData data) {
   auto evb = getEventBase();
   evb->runInLoop(
