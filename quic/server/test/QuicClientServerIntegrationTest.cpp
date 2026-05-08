@@ -13,6 +13,7 @@
 #include <quic/fizz/client/handshake/FizzClientQuicHandshakeContext.h>
 #include <quic/server/QuicServer.h>
 
+#include <folly/io/async/ScopedEventBaseThread.h>
 #include <folly/portability/GMock.h>
 #include <folly/portability/GTest.h>
 #include <memory>
@@ -226,6 +227,176 @@ TEST_F(ServerTransportParameters, disableMigrationParam) {
       serverTransportParams->parameters,
       TransportParameterId::disable_migration);
   EXPECT_NE(it, serverTransportParams->parameters.end());
+}
+
+// ── ThreadedPacketWriter integration ────────────────────────────────────────
+
+namespace {
+
+constexpr size_t kServerPayloadSize = 1000;
+
+// Reads all bytes from a single unidirectional stream, then terminates the
+// given EventBase loop when the FIN arrives.
+class StreamFinReadCallback : public StreamReadCallback {
+ public:
+  StreamFinReadCallback(QuicSocketLite* sock, StreamId id, folly::EventBase* evb)
+      : sock_(sock), id_(id), evb_(evb) {}
+
+  void readAvailable(StreamId) noexcept override {
+    auto res = sock_->read(id_, 0);
+    if (res.hasError()) {
+      evb_->terminateLoopSoon();
+      return;
+    }
+    auto& [buf, fin] = res.value();
+    if (buf) {
+      received_ += buf->computeChainDataLength();
+    }
+    if (fin) {
+      evb_->terminateLoopSoon();
+    }
+  }
+
+  void readError(StreamId, QuicError) noexcept override {
+    evb_->terminateLoopSoon();
+  }
+
+  size_t received_{0};
+
+ private:
+  QuicSocketLite* sock_;
+  StreamId id_;
+  folly::EventBase* evb_;
+};
+
+// Server-side callback: on full handshake done, opens one unidirectional stream
+// and writes kServerPayloadSize bytes with FIN.
+class DataSendingServerCallback : public MockConnectionSetupCallback,
+                                  public MockConnectionCallback {
+ public:
+  explicit DataSendingServerCallback(QuicSocketLite* sock) : sock_(sock) {}
+
+  void onFullHandshakeDone() noexcept override {
+    auto streamId = sock_->createUnidirectionalStream();
+    if (streamId.hasError()) {
+      return;
+    }
+    auto buf = folly::IOBuf::create(kServerPayloadSize);
+    buf->append(kServerPayloadSize);
+    memset(buf->writableData(), 'x', kServerPayloadSize);
+    sock_->writeChain(*streamId, std::move(buf), /*eof=*/true);
+  }
+
+ private:
+  QuicSocketLite* sock_;
+};
+
+class DataSendingTransportFactory : public QuicServerTransportFactory {
+  QuicServerTransport::Ptr make(
+      folly::EventBase* evb,
+      std::unique_ptr<FollyAsyncUDPSocketAlias> socket,
+      const folly::SocketAddress&,
+      QuicVersion quicVersion,
+      std::shared_ptr<const fizz::server::FizzServerContext> ctx) noexcept
+      override {
+    auto trans =
+        QuicServerTransport::make(evb, std::move(socket), nullptr, nullptr, ctx);
+    // Callback is heap-allocated and self-deletes on connection end/error.
+    auto* cb = new DataSendingServerCallback(trans.get());
+    EXPECT_CALL(*cb, onConnectionEnd())
+        .Times(AtMost(1))
+        .WillRepeatedly([cb] { delete cb; });
+    EXPECT_CALL(*cb, onConnectionError(_))
+        .Times(AtMost(1))
+        .WillRepeatedly([cb] { delete cb; });
+    trans->setConnectionSetupCallback(cb);
+    trans->setConnectionCallback(cb);
+    return trans;
+  }
+};
+
+} // namespace
+
+class ThreadedPacketWriterIntegrationTest : public testing::Test {
+ public:
+  void SetUp() override {
+    qEvb_ = std::make_shared<FollyQuicEventBase>(&evb_);
+  }
+
+  void TearDown() override {
+    if (client_) {
+      client_->close(std::nullopt);
+    }
+    if (server_) {
+      server_->shutdown();
+    }
+    // Per shutdown contract: stop drain EVB before destroying writers/workers.
+    drainThread_.reset();
+    // Drain any pending producer-EVB callbacks (e.g. onFatalError).
+    evb_.loop();
+  }
+
+  void startServer() {
+    serverTs_.statelessResetTokenSecret = getRandSecret();
+    server_ = QuicServer::createQuicServer(serverTs_);
+    server_->setFizzContext(quic::test::createServerCtx());
+    server_->setQuicServerTransportFactory(
+        std::make_unique<DataSendingTransportFactory>());
+    drainThread_ = std::make_unique<folly::ScopedEventBaseThread>();
+    server_->setDrainEventBase(drainThread_->getEventBase());
+    server_->start(folly::SocketAddress("::1", 0), 1);
+    server_->waitUntilInitialized();
+  }
+
+  std::shared_ptr<QuicClientTransport> createQuicClient() {
+    CHECK(server_);
+    auto fizzCtx = FizzClientQuicHandshakeContext::Builder()
+                       .setFizzClientContext(quic::test::createClientCtx())
+                       .setCertificateVerifier(createTestCertificateVerifier())
+                       .build();
+    auto client = std::make_shared<QuicClientTransport>(
+        qEvb_,
+        std::make_unique<FollyQuicAsyncUDPSocket>(qEvb_),
+        std::move(fizzCtx));
+    client->addNewPeerAddress(server_->getAddress());
+    client->setHostname("::1");
+    client->setSupportedVersions({QuicVersion::MVFST});
+    return client;
+  }
+
+  std::shared_ptr<QuicClientTransport> client_;
+  std::shared_ptr<QuicServer> server_;
+  TransportSettings serverTs_{};
+  folly::EventBase evb_;
+  std::shared_ptr<FollyQuicEventBase> qEvb_;
+  std::unique_ptr<folly::ScopedEventBaseThread> drainThread_;
+};
+
+// Start a real QuicServer with SharedThreadedPacketWriter enabled, connect a
+// real client, and verify that the server can send application data through
+// the full path: ConnectionPacketWriter → SPSC queue → drain thread →
+// writemGSO → kernel → client.
+TEST_F(ThreadedPacketWriterIntegrationTest, ServerSendsDataThroughThreadedWriter) {
+  startServer();
+  client_ = createQuicClient();
+
+  MockConnectionSetupCallback setupCb;
+  MockConnectionCallback connCb;
+  std::unique_ptr<StreamFinReadCallback> readCb;
+
+  EXPECT_CALL(setupCb, onReplaySafe());
+  EXPECT_CALL(connCb, onNewUnidirectionalStream(_))
+      .WillOnce(Invoke([&](StreamId id) {
+        readCb =
+            std::make_unique<StreamFinReadCallback>(client_.get(), id, &evb_);
+        client_->setReadCallback(id, readCb.get());
+      }));
+
+  client_->start(&setupCb, &connCb);
+  evb_.loopForever(); // terminates when StreamFinReadCallback receives FIN
+
+  ASSERT_NE(readCb, nullptr);
+  EXPECT_EQ(readCb->received_, kServerPayloadSize);
 }
 
 } // namespace quic::test
