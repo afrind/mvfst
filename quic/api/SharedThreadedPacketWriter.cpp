@@ -150,6 +150,7 @@ bool SharedThreadedPacketWriter::assembleNextBatch() {
 
   size_t prevSize = 0;
   size_t gso = 0;
+  size_t segsInChain = 0;
   folly::SocketAddress curAddr;
   ConnectionId curConnId = ConnectionId::createZeroLength();
   bool hasCurrentChain = false;
@@ -164,13 +165,14 @@ bool SharedThreadedPacketWriter::assembleNextBatch() {
     // servers and removes the need for a vector<ConnectionId> per slot.
     bool canAppend = hasCurrentChain && size <= prevSize &&
         (gso == 0 || gso == prevSize) && entry.peerAddr == curAddr &&
-        entry.connId == curConnId && n < maxSegmentsPerMsg_;
+        entry.connId == curConnId && segsInChain < maxSegmentsPerMsg_;
 
     if (canAppend) {
       // Append to current chain.
       bufs_.back()->appendChain(std::move(entry.buf));
       gso = prevSize; // gso is the uniform segment size
       prevSize = size;
+      segsInChain++;
     } else {
       // Finalize the previous chain's gso in opts_.
       if (hasCurrentChain) {
@@ -189,6 +191,7 @@ bool SharedThreadedPacketWriter::assembleNextBatch() {
       n++;
       prevSize = size;
       gso = 0;
+      segsInChain = 1;
       curAddr = entry.peerAddr;
       curConnId = entry.connId;
       hasCurrentChain = true;
