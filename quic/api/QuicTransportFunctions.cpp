@@ -1892,9 +1892,15 @@ quic::Expected<WriteQuicDataResult, QuicError> writeConnectionDataToSocket(
   uint64_t bytesWritten = 0;
   uint64_t shortHeaderPadding = 0;
   [[maybe_unused]] uint64_t shortHeaderPaddingCount = 0;
+  // Capture baseline so pktSentFn() counts packets sent *this call*, not
+  // lifetime total. ConnectionPacketWriter::result_.packetsSent accumulates
+  // across calls; ioBufBatch is fresh each call so needs no adjustment.
+  const uint64_t pktSentBaseline = connection.packetWriter
+      ? connection.packetWriter->getResult().packetsSent
+      : 0;
   auto pktSentFn = [&]() -> uint64_t {
     return connection.packetWriter
-        ? connection.packetWriter->getResult().packetsSent
+        ? connection.packetWriter->getResult().packetsSent - pktSentBaseline
         : static_cast<uint64_t>(ioBufBatch.getPktSent());
   };
 
