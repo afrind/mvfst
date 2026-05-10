@@ -5,6 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <folly/tracing/StaticTracepoint.h>
 #include <quic/api/LoopDetectorCallback.h>
 #include <quic/api/QuicTransportBaseLite.h>
 #include <quic/api/QuicTransportFunctions.h>
@@ -1531,6 +1532,13 @@ quic::Expected<void, QuicError> QuicTransportBaseLite::writeSocketData() {
                 beforeTotalAckElicitingPacketsSent
             /* numAckElicitingPacketsWritten */,
             afterTotalBytesSent - beforeTotalBytesSent /* numBytesWritten */);
+      }
+      if (!newOutstandingPackets) {
+        FOLLY_SDT(
+            quic,
+            write_looper_empty,
+            static_cast<int>(conn_->writeDebugState.writeDataReason),
+            static_cast<int>(conn_->writeDebugState.noWriteReason));
       }
       if (conn_->loopDetectorCallback && newOutstandingPackets) {
         conn_->writeDebugState.currentEmptyLoopCount = 0;

@@ -12,6 +12,7 @@
 #include <folly/io/async/AsyncUDPSocket.h>
 #include <folly/io/async/EventBase.h>
 
+#include <folly/tracing/StaticTracepoint.h>
 #include <quic/common/MvfstLogging.h>
 
 namespace quic {
@@ -93,6 +94,7 @@ bool SharedThreadedPacketWriter::write(
   PacketEntry entry{std::move(buf), encodedSize, peerAddr, connId};
   if (!queue_.enqueue(std::move(entry))) {
     wasEverFull_ = true;
+    FOLLY_SDT(quic, shared_packet_writer_queue_full);
     return false;
   }
   return true;
@@ -150,7 +152,7 @@ bool SharedThreadedPacketWriter::assembleNextBatch() {
 
   size_t prevSize = 0;
   size_t gso = 0;
-  size_t segsInChain = 0;
+  size_t segsInChain = 0; // segments in the current mmsg slot
   folly::SocketAddress curAddr;
   ConnectionId curConnId = ConnectionId::createZeroLength();
   bool hasCurrentChain = false;
@@ -257,6 +259,7 @@ void SharedThreadedPacketWriter::drainQueue() {
 
     if (bufs_.empty()) {
       // hitEnd=true and queue was already empty; nothing to send.
+      FOLLY_SDT(quic, shared_packet_writer_drain_done, totalMsgsSent);
       return;
     }
 
@@ -270,6 +273,11 @@ void SharedThreadedPacketWriter::drainQueue() {
       // Yield to other handlers. If the queue was empty when we last assembled,
       // there's nothing left to drain — skip the wakeup. Any packets the
       // producer adds after this point will fire the eventfd via flush().
+      FOLLY_SDT(
+          quic,
+          shared_packet_writer_yield,
+          totalMsgsSent,
+          hitEnd ? 0 : 1 /*rescheduled*/);
       if (!hitEnd) {
         drainEvb_->runInEventBaseThread([this] { drainQueue(); });
       }
