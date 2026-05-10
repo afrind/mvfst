@@ -212,7 +212,11 @@ void QuicServerWorker::start() {
   }
   if (drainEvb_) {
     sharedWriter_ = std::make_unique<SharedThreadedPacketWriter>(
-        *socket_, evb_.get(), drainEvb_);
+        *socket_,
+        evb_.get(),
+        drainEvb_,
+        /*queueCapacity=*/4096,
+        /*maxSegmentsPerMsg=*/transportSettings_.maxBatchSize);
     sharedWriter_->setOnFatalError(
         [this](const ConnectionId& connId, const QuicError& err) {
           // Runs on producer EVB thread.
