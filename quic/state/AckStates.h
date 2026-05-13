@@ -26,6 +26,12 @@ struct AckState : WriteAckFrameState {
   Optional<PacketNum> largestRecvdPacketNum;
   // Latest packet number acked by peer
   Optional<PacketNum> largestAckedByPeer;
+  // Send time of the packet identified by largestAckedByPeer; used by
+  // RACK time-based loss detection to anchor on the latest ACK receive time
+  // rather than on individual packet send times.
+  Optional<TimePoint> largestAckedByPeerSentTime;
+  // Wall-clock time when we last received an ACK that advanced largestAckedByPeer.
+  Optional<TimePoint> lastAckReceivedTime;
   // Largest received packet number at the time we sent our last close message.
   Optional<PacketNum> largestReceivedAtLastCloseSent;
   // Next PacketNum we will send for packet in this packet number space

@@ -374,6 +374,9 @@ quic::Expected<void, QuicError> processClientInitialParams(
         TransportErrorCode::TRANSPORT_PARAMETER_ERROR,
         "Max Ack Delay is greater than 2^14 "));
   }
+  if (maxAckDelay.has_value()) {
+    conn.peerMaxAckDelay = std::chrono::milliseconds(*maxAckDelay);
+  }
 
   if (activeConnectionIdLimit &&
       activeConnectionIdLimit < kDefaultActiveConnectionIdLimit) {

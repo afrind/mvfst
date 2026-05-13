@@ -442,6 +442,62 @@ TEST_F(SharedThreadedPacketWriterTest, GSOGrouping_CrossConnection) {
   EXPECT_EQ(segCount.load(), 2u);
 }
 
+// A single connection sends 1200, 1200, 700, 700.
+// Expected GSO grouping:
+//   Slot 0: {1200, 1200, 700} = 3100 bytes  gso=1200  (700 is valid smaller terminal)
+//   Slot 1: {700}             =  700 bytes  gso=0     (breaks chain: gso=1200 != prevSize=700)
+TEST_F(SharedThreadedPacketWriterTest, GSOGrouping_1200_1200_700_700) {
+  makeWriter();
+
+  folly::Baton<> done;
+  // Captured on the drain thread; safe to read after done + awaitDrain().
+  struct SlotInfo {
+    size_t totalBytes{0};
+    size_t segCount{0};
+    int gso{0};
+  };
+  std::vector<SlotInfo> slots;
+
+  EXPECT_CALL(*sock_, writemGSO(_, _, _, _))
+      .WillRepeatedly(Invoke(
+          [&](folly::Range<folly::SocketAddress const*>,
+              const BufPtr* bufs,
+              size_t count,
+              const folly::AsyncUDPSocket::WriteOptions* opts) -> int {
+            for (size_t i = 0; i < count; i++) {
+              SlotInfo s;
+              s.segCount = bufs[i]->countChainElements();
+              s.totalBytes = bufs[i]->computeChainDataLength();
+              s.gso = opts ? opts[i].gso : 0;
+              slots.push_back(s);
+            }
+            done.post();
+            return static_cast<int>(count);
+          }));
+
+  auto connId = makeConnId(1);
+  onProducer([&] {
+    EXPECT_TRUE(writer_->write(makeBuf(1200), 1200, peer_, connId));
+    EXPECT_TRUE(writer_->write(makeBuf(1200), 1200, peer_, connId));
+    EXPECT_TRUE(writer_->write(makeBuf(700), 700, peer_, connId));
+    EXPECT_TRUE(writer_->write(makeBuf(700), 700, peer_, connId));
+    writer_->flush();
+  });
+
+  done.wait();
+  awaitDrain();
+
+  ASSERT_EQ(slots.size(), 2u);
+  // Slot 0: three segments chained → 3100-byte GSO super-packet, gso stride 1200.
+  EXPECT_EQ(slots[0].segCount, 3u);
+  EXPECT_EQ(slots[0].totalBytes, 3100u);
+  EXPECT_EQ(slots[0].gso, 1200);
+  // Slot 1: single 700-byte packet; no GSO needed.
+  EXPECT_EQ(slots[1].segCount, 1u);
+  EXPECT_EQ(slots[1].totalBytes, 700u);
+  EXPECT_EQ(slots[1].gso, 0);
+}
+
 #endif // FOLLY_HAVE_MSG_ERRQUEUE
 
 // assembleNextBatch fills at most maxMsgsPerCall_ slots. A second batch that

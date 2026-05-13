@@ -65,6 +65,10 @@ SharedThreadedPacketWriter::SharedThreadedPacketWriter(
   // writemGSO is always called with null options (gso==0 in every batch entry).
 #ifndef FOLLY_HAVE_MSG_ERRQUEUE
   maxSegmentsPerMsg_ = 1;
+#else
+  // UDP_MAX_SEGMENTS=128 is the kernel's per-super-packet GSO segment limit.
+  // Exceeding it causes silent drops after sendmsg() returns success.
+  maxSegmentsPerMsg_ = std::min(maxSegmentsPerMsg_, size_t(128));
 #endif
 
   int sockFd = sock_.getNetworkSocket().toFd();
@@ -72,6 +76,7 @@ SharedThreadedPacketWriter::SharedThreadedPacketWriter(
       this, drainEvb_, sockFd);
 
   bufs_.reserve(maxMsgsPerCall_);
+  segCounts_.resize(maxMsgsPerCall_, 0);
   connIds_.resize(maxMsgsPerCall_, ConnectionId::createZeroLength());
   addrs_.resize(maxMsgsPerCall_);
   opts_.resize(maxMsgsPerCall_);
@@ -80,6 +85,7 @@ SharedThreadedPacketWriter::SharedThreadedPacketWriter(
 }
 
 SharedThreadedPacketWriter::~SharedThreadedPacketWriter() {
+  flushCallback_.cancelLoopCallback();
   bufs_.clear();
 }
 
@@ -91,17 +97,42 @@ bool SharedThreadedPacketWriter::write(
   if (closed_.load(std::memory_order_relaxed)) {
     return false;
   }
+  MVCHECK(peerAddr.isFamilyInet()) << "bad peerAddr family="
+      << peerAddr.getFamily() << " connId=" << connId.hex();
   PacketEntry entry{std::move(buf), encodedSize, peerAddr, connId};
   if (!queue_.enqueue(std::move(entry))) {
     wasEverFull_ = true;
     FOLLY_SDT(quic, shared_packet_writer_queue_full);
+    if (stats_) {
+      stats_->queueFull.fetch_add(1, std::memory_order_relaxed);
+    }
     return false;
+  }
+  FOLLY_SDT(quic, shared_packet_writer_enqueue, queue_.sizeGuess());
+  if (stats_) {
+    stats_->packetsEnqueued.fetch_add(1, std::memory_order_relaxed);
   }
   return true;
 }
 
 void SharedThreadedPacketWriter::flush() {
-  queue_.flush();
+  if (++pendingCount_ >= kEagerFlushThreshold) {
+    pendingCount_ = 0;
+    pendingFlush_ = false;
+    queue_.flush();
+  } else if (!pendingFlush_) {
+    // First pending packet this loop: arm the callback to flush the tail.
+    pendingFlush_ = true;
+    producerEvb_->runBeforeLoop(&flushCallback_);
+  }
+}
+
+void SharedThreadedPacketWriter::FlushLoopCallback::runLoopCallback() noexcept {
+  // pendingFlush_ is always true when we reach here (we only arm on first pending).
+  w_->pendingFlush_ = false;
+  w_->pendingCount_ = 0;
+  w_->queue_.flush();
+  // Do not re-arm; flush() will re-arm next time it has pending data.
 }
 
 void SharedThreadedPacketWriter::registerBlocked(
@@ -161,12 +192,16 @@ bool SharedThreadedPacketWriter::assembleNextBatch() {
       nullptr, 0, folly::SocketAddress{}, ConnectionId::createZeroLength()};
   while (n < maxMsgsPerCall_ && queue_.dequeue(entry)) {
     size_t size = entry.encodedSize;
-    // GSO grouping: same connection, same peer address, non-increasing packet
-    // size, and chain not yet at the segment limit. Cross-connection coalescing
-    // (same addr, different connId) is intentionally excluded — it's rare on
-    // servers and removes the need for a vector<ConnectionId> per slot.
-    bool canAppend = hasCurrentChain && size <= prevSize &&
-        (gso == 0 || gso == prevSize) && entry.peerAddr == curAddr &&
+    // GSO grouping: same connection, same peer address, uniform packet
+    // size, and chain not yet at the segment limit. Mixing sizes is excluded:
+    // a non-uniform tail (size < prevSize) requires gso_size == all non-last
+    // segments, but the canAppend path sets gso from the opener's encodedSize,
+    // not from buf->computeChainDataLength() — if those ever diverge the kernel
+    // splits at the wrong byte offset and corrupts all segments in the batch.
+    // Cross-connection coalescing is also excluded — it's rare on servers and
+    // removes the need for a vector<ConnectionId> per slot.
+    bool canAppend = hasCurrentChain && size == prevSize &&
+        entry.peerAddr == curAddr &&
         entry.connId == curConnId && segsInChain < maxSegmentsPerMsg_;
 
     if (canAppend) {
@@ -176,11 +211,12 @@ bool SharedThreadedPacketWriter::assembleNextBatch() {
       prevSize = size;
       segsInChain++;
     } else {
-      // Finalize the previous chain's gso in opts_.
+      // Finalize the previous chain's gso and segment count in opts_/segCounts_.
       if (hasCurrentChain) {
         // n >= 1: hasCurrentChain is only set after the first push_back.
         opts_[n - 1] = folly::AsyncUDPSocket::WriteOptions(
             static_cast<int>(gso), /*zerocopy=*/false);
+        segCounts_[n - 1] = segsInChain;
         if (gso > 0) {
           needsGso_ = true;
         }
@@ -203,6 +239,7 @@ bool SharedThreadedPacketWriter::assembleNextBatch() {
   if (hasCurrentChain) {
     opts_[n - 1] = folly::AsyncUDPSocket::WriteOptions(
         static_cast<int>(gso), /*zerocopy=*/false);
+    segCounts_[n - 1] = segsInChain;
     if (gso > 0) {
       needsGso_ = true;
     }
@@ -239,6 +276,24 @@ ssize_t SharedThreadedPacketWriter::sendBatch() {
   // Success: release IOBufs. addrs_/opts_/connIds_ stay at maxMsgsPerCall_
   // size so assembleNextBatch always has pre-initialized slots to overwrite.
   // Unsent entries (ret < n) are treated as loss; QUIC retransmits.
+  FOLLY_SDT(quic, shared_packet_writer_batch_result, n, static_cast<size_t>(ret));
+  if (stats_) {
+    // segCounts_[i] = packets dequeued into slot i; each becomes one UDP
+    // datagram (or N datagrams via kernel GSO splitting for GSO slots).
+    size_t segs = 0;
+    for (size_t i = 0; i < static_cast<size_t>(ret); i++) {
+      segs += segCounts_[i];
+    }
+    stats_->packetsSent.fetch_add(segs, std::memory_order_relaxed);
+    if (static_cast<size_t>(ret) < n) {
+      FOLLY_SDT(quic, shared_packet_writer_partial_send, n, ret);
+      size_t dropped = 0;
+      for (size_t i = static_cast<size_t>(ret); i < n; i++) {
+        dropped += segCounts_[i];
+      }
+      stats_->partialDropped.fetch_add(dropped, std::memory_order_relaxed);
+    }
+  }
   bufs_.clear();
   return static_cast<ssize_t>(ret); // message count, not bytes
 }
@@ -279,7 +334,9 @@ void SharedThreadedPacketWriter::drainQueue() {
           totalMsgsSent,
           hitEnd ? 0 : 1 /*rescheduled*/);
       if (!hitEnd) {
-        drainEvb_->runInEventBaseThread([this] { drainQueue(); });
+        // Use drainLoop (not drainQueue) so the bufs_.empty() guard fires if
+        // a concurrent EAGAIN left bufs_ non-empty before this callback runs.
+        drainEvb_->runInEventBaseThread([this] { drainLoop(); });
       }
       return;
     }

@@ -8,6 +8,7 @@
 #include <quic/common/MvfstLogging.h>
 #include <quic/logging/QLoggerMacros.h>
 #include <quic/loss/QuicLossFunctions.h>
+#include <folly/tracing/StaticTracepoint.h>
 #include <quic/observer/SocketObserverMacros.h>
 #include <quic/state/QuicStreamFunctions.h>
 
@@ -324,25 +325,62 @@ quic::Expected<bool, QuicError> processOutstandingsForLoss(
     largestAckedForComparison =
         std::max(largestAckedForComparison, currentPacketNum);
 
-    // TODO, should we ignore this if srtt == 0?
-    bool lostByTimeout = (lossTime - pkt.metadata.time) > delayUntilLost;
+    // RACK time-based loss: anchor on latest ACK receive time, not packet send
+    // time.  Mirrors picoquic: (timeSinceAck + deltaSent) > rackDelay + maxAckDelay
+    // where deltaSent = largestAckedSentTime - pkt.sendTime.  Falls back to
+    // send-time measurement if we haven't received an ACK yet.
+    bool lostByTimeout = false;
+    std::chrono::microseconds timeSinceAckUs{0};
+    std::chrono::microseconds deltaSentUs{0};
+    {
+      const auto& ackSentTime =
+          getAckState(conn, pnSpace).largestAckedByPeerSentTime;
+      const auto& lastAckTime =
+          getAckState(conn, pnSpace).lastAckReceivedTime;
+      if (ackSentTime.has_value() && lastAckTime.has_value()) {
+        deltaSentUs = std::max(
+            std::chrono::microseconds{0},
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                *ackSentTime - pkt.metadata.time));
+        timeSinceAckUs =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                lossTime - *lastAckTime);
+        lostByTimeout = (timeSinceAckUs + deltaSentUs) > delayUntilLost;
+      } else {
+        timeSinceAckUs = std::chrono::duration_cast<std::chrono::microseconds>(
+            lossTime - pkt.metadata.time);
+        lostByTimeout = timeSinceAckUs > delayUntilLost;
+      }
+    }
     const auto reorderDistance = largestAckedForComparison - currentPacketNum;
     auto reorderingThreshold = conn.lossState.reorderingThreshold;
 
     const auto& skippedPacketNum = getAckState(conn, pnSpace).skippedPacketNum;
     if (skippedPacketNum && skippedPacketNum.value() >= currentPacketNum &&
         skippedPacketNum.value() <= largestAckedForComparison) {
-      // A skipped packet number is in the distance we're measuring, so
-      // we account for it in the reordering threshold.
       reorderingThreshold += 1;
     }
     bool lostByReorder = reorderDistance > reorderingThreshold;
+    auto timeSinceSent = std::chrono::duration_cast<std::chrono::microseconds>(
+        lossTime - pkt.metadata.time);
 
     if (!(lostByTimeout || lostByReorder)) {
       shouldSetTimer = true;
       iter++;
       continue;
     }
+
+    // Args: lostPkt, largestAcked, reorderDistance, reorderingThreshold,
+    //       lostByTimeout, timeSinceSentUs, timeSinceAckUs, deltaSentUs
+    FOLLY_SDT(quic, rack_loss,
+        (uint64_t)currentPacketNum,
+        (uint64_t)largestAcked,
+        (uint64_t)reorderDistance,
+        (uint64_t)reorderingThreshold,
+        (int)lostByTimeout,
+        (uint64_t)timeSinceSent.count(),
+        (uint64_t)timeSinceAckUs.count(),
+        (uint64_t)deltaSentUs.count());
 
     if (pkt.maybeClonedPacketIdentifier) {
       MVCHECK(conn.outstandings.clonedPacketCount[pnSpace]);
@@ -412,9 +450,12 @@ detectLossPackets(
   getLossTime(conn, pnSpace).reset();
   std::chrono::microseconds rttSample =
       std::max(conn.lossState.srtt, conn.lossState.lrtt);
-  std::chrono::microseconds delayUntilLost = rttSample *
-      conn.transportSettings.timeReorderingThreshDividend /
-      conn.transportSettings.timeReorderingThreshDivisor;
+  // RACK time threshold: rackDelay + peerMaxAckDelay (picoquic-style).
+  // rackDelay caps at 5ms (PICOQUIC_RACK_DELAY/2) so it doesn't dominate at
+  // high RTT.  peerMaxAckDelay defaults to 25ms (RFC 9002 §6.1.1 assumed value).
+  std::chrono::microseconds rackDelay =
+      std::min(rttSample / 4, std::chrono::microseconds{5000});
+  std::chrono::microseconds delayUntilLost = rackDelay + conn.peerMaxAckDelay;
   MVVLOG(10) << __func__
              << " outstanding=" << conn.outstandings.numOutstanding()
              << " largestAcked=" << ackState.largestAckedByPeer.value_or(0)
@@ -517,9 +558,15 @@ handleAckForLoss(
     conn.lossState.pathDegradingFired = false;
     conn.lossState.blackholeFired = false;
     // Update the largest acked packet number
-    ackState.largestAckedByPeer = std::max<PacketNum>(
+    PacketNum newLargest = std::max<PacketNum>(
         ackState.largestAckedByPeer.value_or(*ack.largestNewlyAckedPacket),
         *ack.largestNewlyAckedPacket);
+    if (!ackState.largestAckedByPeer.has_value() ||
+        newLargest >= *ackState.largestAckedByPeer) {
+      ackState.largestAckedByPeerSentTime = ack.largestNewlyAckedPacketSentTime;
+      ackState.lastAckReceivedTime = ack.ackTime;
+    }
+    ackState.largestAckedByPeer = newLargest;
   }
   auto lossEventResult =
       detectLossPackets(conn, ackState, lossVisitor, ack.ackTime, pnSpace);

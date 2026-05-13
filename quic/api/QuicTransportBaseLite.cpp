@@ -3105,6 +3105,8 @@ void QuicTransportBaseLite::setTransportSettings(
     MVCHECK(
         conn_->bufAccessor ||
         transportSettings.dataPathType != DataPathType::ContinuousMemory);
+    conn_->lossState.reorderingThreshold =
+        transportSettings.reorderingThreshold;
     conn_->transportSettings = std::move(transportSettings);
     auto result = conn_->streamManager->refreshTransportSettings(
         conn_->transportSettings);

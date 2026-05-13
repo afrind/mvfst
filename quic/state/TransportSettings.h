@@ -526,6 +526,11 @@ struct TransportSettings {
   // Number of consecutive PTOs before firing onBlackholeDetected.
   // Must be > numPtosForPathDegrading and < maxNumPTOs.
   uint16_t numPtosForBlackhole{kDefaultNumPtosForBlackhole};
+
+  // RACK loss detection: reorder distance threshold (RFC 9002 §6.1.1).
+  // A packet is declared lost by reorder if reorderDistance > this value.
+  // Default 3. Increase (e.g., 8–16) when GSO/batching causes spurious reorders.
+  uint32_t reorderingThreshold{kReorderingThreshold};
 };
 
 } // namespace quic

@@ -11,6 +11,16 @@
 #include <quic/fizz/handshake/FizzBridge.h>
 #include <quic/state/QuicStreamFunctions.h>
 #include <cstdint>
+#include <fizz/util/KeyLogWriter.h>
+#include <mutex>
+
+namespace {
+fizz::KeyLogWriter& getKeyLogWriter() {
+  static fizz::KeyLogWriter writer("/tmp/quic_keylog.log");
+  return writer;
+}
+static std::mutex gKeyLogMutex;
+} // namespace
 
 namespace quic {
 ServerHandshake::ServerHandshake(QuicConnectionStateBase* conn)
@@ -500,6 +510,19 @@ class ServerHandshake::ActionMoveVisitor {
         break;
       case fizz::SecretType::Type::MasterSecrets_E:
         break;
+    }
+    if (server_.state_.clientRandom()) {
+      auto label = fizz::KeyLogWriter::secretToNSSLabel(
+          secretAvailable.secret.type);
+      if (label) {
+        std::lock_guard<std::mutex> lock(gKeyLogMutex);
+        getKeyLogWriter().write(
+            *server_.state_.clientRandom(),
+            *label,
+            folly::ByteRange(
+                secretAvailable.secret.secret.data(),
+                secretAvailable.secret.secret.size()));
+      }
     }
     server_.handshakeEventAvailable_ = true;
   }

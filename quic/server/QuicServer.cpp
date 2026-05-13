@@ -5,6 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <quic/api/SharedThreadedPacketWriter.h>
 #include <quic/common/MvfstLogging.h>
 #include <quic/server/QuicServer.h>
 
@@ -137,6 +138,12 @@ bool QuicServer::isInitialized() const noexcept {
 void QuicServer::setDrainEventBase(folly::EventBase* drainEvb) {
   checkRunningInThread(mainThreadId_);
   drainEvb_ = drainEvb;
+}
+
+void QuicServer::setSharedWriterStats(
+    std::shared_ptr<SharedThreadedPacketWriterStats> stats) {
+  checkRunningInThread(mainThreadId_);
+  sharedWriterStats_ = std::move(stats);
 }
 
 void QuicServer::start(const folly::SocketAddress& address, size_t maxWorkers) {
@@ -275,6 +282,9 @@ std::unique_ptr<QuicServerWorker> QuicServer::newWorkerWithoutSocket() {
   worker->setQuicExperimentHandlerFn(quicExperimentHandlerFn_);
   if (drainEvb_) {
     worker->setDrainEventBase(drainEvb_);
+  }
+  if (sharedWriterStats_) {
+    worker->setSharedWriterStats(sharedWriterStats_);
   }
   return worker;
 }

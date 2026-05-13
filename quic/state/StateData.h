@@ -573,6 +573,10 @@ struct QuicConnectionStateBase : public folly::DelayedDestruction {
   // IMMEDIATE_ACK frames.
   OptionalMicros peerMinAckDelay;
 
+  // The peer's max_ack_delay from transport parameters (RFC 9000 §18.2).
+  // RFC 9002 §6.1.1: if absent, assume 25ms.
+  std::chrono::microseconds peerMaxAckDelay{25000us};
+
   // Idle timeout advertised by the peer. Initially sets it to the maximum value
   // until the handshake sets the timeout.
   std::chrono::milliseconds peerIdleTimeout{kMaxIdleTimeout};

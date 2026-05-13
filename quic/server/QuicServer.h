@@ -334,6 +334,14 @@ class QuicServer : public QuicServerWorker::WorkerCallback,
   void setDrainEventBase(folly::EventBase* drainEvb);
 
   /**
+   * Attach aggregate stats counters to all threaded packet writers.
+   * Must be called before start(). The shared_ptr is forwarded to each
+   * QuicServerWorker so all workers contribute to the same counters.
+   */
+  void setSharedWriterStats(
+      std::shared_ptr<SharedThreadedPacketWriterStats> stats);
+
+  /**
    * Returns vector of running eventbases.
    * This is useful if QuicServer is initialized with a 'default' mode by just
    * specifying number of workers.
@@ -503,6 +511,7 @@ class QuicServer : public QuicServerWorker::WorkerCallback,
 
   // Drain EventBase for SharedThreadedPacketWriter; null = inline path.
   folly::EventBase* drainEvb_{nullptr};
+  std::shared_ptr<SharedThreadedPacketWriterStats> sharedWriterStats_;
 
   // Options to AsyncUDPSocket::bind, only controls IPV6_ONLY currently.
   FollyAsyncUDPSocketAlias::BindOptions bindOptions_;

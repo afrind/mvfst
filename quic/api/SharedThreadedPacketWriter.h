@@ -9,6 +9,7 @@
 
 #include <atomic>
 #include <functional>
+#include <memory>
 #include <vector>
 
 #include <folly/io/async/EventBase.h>
@@ -21,6 +22,18 @@
 #include <quic/common/EventFdQueue.h>
 
 namespace quic {
+
+/**
+ * Aggregate send-path counters for SharedThreadedPacketWriter.
+ * Thread-safe: all fields are atomics. Shared across all STPW instances
+ * in a process (typically one per IO worker) via std::shared_ptr.
+ */
+struct SharedThreadedPacketWriterStats {
+  std::atomic<uint64_t> packetsEnqueued{0};  // write() returned true
+  std::atomic<uint64_t> queueFull{0};        // write() returned false (queue full)
+  std::atomic<uint64_t> packetsSent{0};      // segments handed to writemGSO
+  std::atomic<uint64_t> partialDropped{0};   // segments lost to partial sendmmsg
+};
 
 struct PacketEntry {
   BufPtr buf;
@@ -108,6 +121,12 @@ class SharedThreadedPacketWriter {
   // Called by QuicServer::shutdown(). After this, enqueues return false.
   void close();
 
+  // Attach an aggregate stats object. May be called before or after start.
+  // Counters are incremented atomically; safe to share across STPW instances.
+  void setStats(std::shared_ptr<SharedThreadedPacketWriterStats> stats) {
+    stats_ = std::move(stats);
+  }
+
   // Set callbacks invoked on the producer EVB when errors occur or the queue
   // drains after backpressure. Both are called on the producer EVB thread.
   // onFatalError is called once per affected connection; onResumeProducer is
@@ -157,7 +176,22 @@ class SharedThreadedPacketWriter {
     SharedThreadedPacketWriter* writer_;
   };
 
+  // Coalesced flush: producer calls flush() per-connection, but we only write
+  // to the eventfd once per EVB loop (or when pendingCount_ hits the threshold).
+  // All fields are producer-EVB-thread-only; no atomics needed.
+  static constexpr size_t kEagerFlushThreshold = 16;
+
+  class FlushLoopCallback : public folly::EventBase::LoopCallback {
+   public:
+    explicit FlushLoopCallback(SharedThreadedPacketWriter* w) : w_(w) {}
+    void runLoopCallback() noexcept override;
+
+   private:
+    SharedThreadedPacketWriter* w_;
+  };
+
   std::atomic<bool> closed_{false};
+  std::shared_ptr<SharedThreadedPacketWriterStats> stats_;
   EventFdQueue<PacketEntry> queue_;
   size_t maxSegmentsPerMsg_;
   size_t maxMsgsPerCall_;
@@ -173,6 +207,9 @@ class SharedThreadedPacketWriter {
   // bufs_ and connIds_ are populated together by assembleNextBatch and
   // preserved across EAGAIN so retryAndDrain can resend without rebuilding.
   std::vector<BufPtr> bufs_;
+  // One entry per mmsg slot: segment count (packets chained into this slot).
+  // Tracked during assembleNextBatch() and used by sendBatch() for stats.
+  std::vector<size_t> segCounts_;
   // One entry per mmsg slot: the chain-opener's connId. GSO chains are
   // restricted to a single connection so one connId per slot is sufficient.
   std::vector<ConnectionId> connIds_;
@@ -182,6 +219,9 @@ class SharedThreadedPacketWriter {
 
   // Producer EVB thread only:
   std::vector<ConnectionId> blockedConnIds_;
+  bool pendingFlush_{false};
+  size_t pendingCount_{0};
+  FlushLoopCallback flushCallback_{this};
 
   // Written on producer thread (write()), read/cleared on drain thread
   // (drainQueue()). Must be atomic to avoid a data race: the write happens

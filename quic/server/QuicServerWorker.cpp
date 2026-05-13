@@ -204,6 +204,11 @@ void QuicServerWorker::setDrainEventBase(folly::EventBase* drainEvb) {
   drainEvb_ = drainEvb;
 }
 
+void QuicServerWorker::setSharedWriterStats(
+    std::shared_ptr<quic::SharedThreadedPacketWriterStats> stats) {
+  sharedWriterStats_ = std::move(stats);
+}
+
 void QuicServerWorker::start() {
   MVCHECK(socket_);
   if (!pacingTimer_) {
@@ -216,7 +221,14 @@ void QuicServerWorker::start() {
         evb_.get(),
         drainEvb_,
         /*queueCapacity=*/4096,
-        /*maxSegmentsPerMsg=*/transportSettings_.maxBatchSize);
+        /*maxSegmentsPerMsg=*/transportSettings_.batchingMode ==
+                QuicBatchingMode::BATCHING_MODE_GSO
+            ? transportSettings_.maxBatchSize
+            : 1,
+        /*maxMsgsPerCall=*/16);
+    if (sharedWriterStats_) {
+      sharedWriter_->setStats(sharedWriterStats_);
+    }
     sharedWriter_->setOnFatalError(
         [this](const ConnectionId& connId, const QuicError& err) {
           // Runs on producer EVB thread.
@@ -555,6 +567,12 @@ void QuicServerWorker::onNotifyDataAvailable(
     if (static_cast<uint16_t>(numRecvd) < batchSize) {
       break;
     }
+  }
+  // If we hit the cap with a full batch, data may remain in the socket buffer.
+  // Re-schedule a drain so other EVB callbacks run first (write loopers, timers)
+  // before we read more — preserving the ceiling while ensuring full drainage.
+  if (totalRecvd >= maxPkts) {
+    evb_->runInLoop([this] { onNotifyDataAvailable(*socket_); });
   }
 }
 
